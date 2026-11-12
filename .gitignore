@@ -1,0 +1,26 @@
+﻿# Python
+__pycache__/
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+frontend/.turbo/
+frontend/.vercel/
+
+# Local data artifacts
+data/

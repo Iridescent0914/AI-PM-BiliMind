@@ -1,0 +1,647 @@
+"""
+Bilibili RAG 知识库系统
+
+视频内容获取服务 - 二级降级策略
+"""
+from typing import Optional
+from urllib.parse import urlparse
+import asyncio
+import math
+import os
+import shutil
+import subprocess
+import time
+import httpx
+from loguru import logger
+from app.models import VideoContent, ContentSource
+from app.services.bilibili import BilibiliService
+from app.services.asr import ASRService
+
+
+class ContentFetcher:
+    """
+    视频内容获取器
+    
+    采用二级降级策略：
+    1. 音频转写（ASR）
+    2. 视频基本信息 (兜底)
+    """
+    
+    def __init__(self, bilibili_service: BilibiliService, asr_service: ASRService):
+        self.bili = bilibili_service
+        self.asr = asr_service
+
+    def _segments_to_text(self, segments: list[dict]) -> str:
+        return "\n".join(
+            (item.get("text") or "").strip()
+            for item in (segments or [])
+            if (item.get("text") or "").strip()
+        ).strip()
+
+    def _extract_key_points_from_outline(self, outline: list[dict], summary: str = "") -> list[str]:
+        points: list[str] = []
+        for item in outline or []:
+            if not isinstance(item, dict):
+                continue
+            title = (item.get("title") or "").strip()
+            if title and title not in points:
+                points.append(title)
+            for point in item.get("points") or []:
+                if not isinstance(point, dict):
+                    continue
+                content = (point.get("content") or "").strip()
+                if content and content not in points:
+                    points.append(content)
+            if len(points) >= 5:
+                break
+
+        if not points and summary:
+            for line in summary.splitlines():
+                cleaned = line.strip().lstrip("-•0123456789. ")
+                if cleaned and cleaned not in points:
+                    points.append(cleaned)
+                if len(points) >= 5:
+                    break
+
+        return points[:5]
+    
+    async def fetch_content(self, bvid: str, cid: int = None, title: str = None) -> VideoContent:
+        """
+        获取视频内容，自动降级
+        
+        Args:
+            bvid: 视频 BV 号
+            cid: 视频 cid (如果没有会自动获取)
+            title: 视频标题 (如果没有会自动获取)
+            
+        Returns:
+            VideoContent 对象
+        """
+        # 获取视频基本信息
+        video_info = None
+        if not cid or not title:
+            try:
+                video_info = await self.bili.get_video_info(bvid)
+                if not cid:
+                    cid = video_info.get("cid")
+                if not title:
+                    title = video_info.get("title", "未知标题")
+            except Exception as e:
+                logger.error(f"获取视频信息失败 [{bvid}]: {e}")
+                return VideoContent(
+                    bvid=bvid,
+                    title=title or "未知标题",
+                    content="无法获取视频信息",
+                    source=ContentSource.BASIC_INFO
+                )
+        
+        description = video_info.get("desc", "") if video_info else ""
+        
+        subtitle_result = await self._try_subtitle(bvid, cid, video_info=video_info)
+        if subtitle_result:
+            logger.info(f"[{bvid}] 使用字幕文字稿")
+            return VideoContent(
+                bvid=bvid,
+                title=title,
+                content=subtitle_result["text"],
+                source=ContentSource.SUBTITLE,
+                transcript=subtitle_result["segments"],
+            )
+
+        logger.info(f"[{bvid}] 未获取到可用字幕，尝试 ASR")
+        asr_result = await self._try_asr(bvid, cid)
+        if asr_result:
+            logger.info(f"[{bvid}] 使用 ASR 文字稿")
+            return VideoContent(
+                bvid=bvid,
+                title=title,
+                content=asr_result["text"],
+                source=ContentSource.ASR,
+                transcript=asr_result["segments"],
+            )
+
+        up_mid = None
+        if video_info:
+            owner = video_info.get("owner") or {}
+            up_mid = owner.get("mid")
+        ai_summary = await self._try_ai_summary(bvid, cid, up_mid=up_mid)
+        if ai_summary:
+            logger.info(f"[{bvid}] 使用 B站 AI 摘要")
+            summary_text = (ai_summary.get("summary") or "").strip()
+            outline = ai_summary.get("outline") or []
+            content_parts = []
+            if summary_text:
+                content_parts.append(summary_text)
+            for item in outline:
+                if not isinstance(item, dict):
+                    continue
+                title_text = (item.get("title") or "").strip()
+                if title_text:
+                    content_parts.append(title_text)
+                for point in item.get("points") or []:
+                    if not isinstance(point, dict):
+                        continue
+                    point_text = (point.get("content") or "").strip()
+                    if point_text:
+                        content_parts.append(point_text)
+
+            ai_content = "\n".join(content_parts).strip() or summary_text
+            return VideoContent(
+                bvid=bvid,
+                title=title,
+                content=ai_content,
+                source=ContentSource.AI_SUMMARY,
+                outline=outline,
+                summary={
+                    "summary": summary_text or ai_content,
+                    "key_points": self._extract_key_points_from_outline(outline, summary_text),
+                },
+            )
+        
+        # ASR 失败时，补齐基础信息（避免遗漏简介）
+        if not video_info:
+            try:
+                video_info = await self.bili.get_video_info(bvid)
+            except Exception as e:
+                logger.debug(f"[{bvid}] 获取视频信息失败(兜底): {e}")
+
+        if video_info and not description:
+            description = video_info.get("desc", "") or description
+
+        # Level 3: 使用基本信息兜底
+        logger.info(f"[{bvid}] 使用基本信息")
+        basic_content = f"视频标题：{title}"
+        if description:
+            basic_content += f"\n\n视频简介：{description}"
+        
+        return VideoContent(
+            bvid=bvid,
+            title=title,
+            content=basic_content,
+            source=ContentSource.BASIC_INFO
+        )
+
+    async def _try_asr(self, bvid: str, cid: int) -> Optional[dict]:
+        """尝试进行音频转写"""
+        try:
+            audio_url = await self.bili.get_audio_url(bvid, cid)
+            if not audio_url:
+                logger.info(f"[{bvid}] 未获取到音频 URL")
+                return None
+            status = await self._probe_audio_url(bvid, audio_url)
+            if status is not None and status < 400:
+                logger.info(f"[{bvid}] 音频 URL 可达，使用 Transcription")
+                result = await self.asr.transcribe_url_verbose(audio_url)
+            else:
+                logger.info(f"[{bvid}] 音频 URL 不可达，使用 Recognition 兜底")
+                result = await self._try_asr_with_local_audio(bvid, cid, audio_url)
+
+            text = (result or {}).get("text", "")
+            if not text or len(text) < 50:
+                logger.info(f"[{bvid}] ASR 内容过少")
+                return None
+            preview = text[:120].replace("\n", " ").strip()
+            logger.info(f"[{bvid}] ASR 成功，长度={len(text)}，预览：{preview}")
+            return result
+        except Exception as e:
+            logger.warning(f"[{bvid}] ASR 失败: {e}")
+            return None
+
+    async def _probe_audio_url(self, bvid: str, audio_url: str) -> Optional[int]:
+        """探测音频 URL 可达性（不带 Cookie，模拟 ASR 服务拉取）"""
+        try:
+            parsed = urlparse(audio_url)
+            safe_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
+        except Exception:
+            safe_url = "unknown"
+
+        timeout = httpx.Timeout(10.0, connect=5.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+            status = None
+            try:
+                head = await client.head(audio_url)
+                status = head.status_code
+            except Exception as e:
+                logger.info(f"[{bvid}] 音频 URL HEAD 失败: {e}")
+
+            if status is None or status >= 400:
+                try:
+                    headers = {"Range": "bytes=0-0"}
+                    get = await client.get(audio_url, headers=headers)
+                    status = get.status_code
+                except Exception as e:
+                    logger.info(f"[{bvid}] 音频 URL GET 失败: {e}")
+
+        if status is None:
+            logger.info(f"[{bvid}] 音频 URL 不可达: {safe_url}")
+        else:
+            logger.info(f"[{bvid}] 音频 URL 可达性: {status} - {safe_url}")
+        return status
+
+    async def _try_asr_with_local_audio(
+        self, bvid: str, cid: int, audio_url: str
+    ) -> Optional[dict]:
+        """本地下载后使用 Recognition 直传"""
+        tmp_dir = os.path.join("data", "asr_tmp")
+        os.makedirs(tmp_dir, exist_ok=True)
+
+        try:
+            parsed = urlparse(audio_url)
+            ext = os.path.splitext(parsed.path)[1] or ".m4s"
+        except Exception:
+            ext = ".m4s"
+
+        filename = f"{bvid}_{cid}_{int(time.time())}{ext}"
+        file_path = os.path.join(tmp_dir, filename)
+
+        ok = await self.bili.download_audio_to_file(audio_url, file_path)
+        if not ok:
+            logger.info(f"[{bvid}] 本地下载音频失败")
+            return None
+
+        if os.path.exists(file_path) and os.path.getsize(file_path) < 1024:
+            logger.info(f"[{bvid}] 本地音频文件过小，跳过上传")
+            try:
+                os.remove(file_path)
+            except Exception:
+                logger.debug(f"[{bvid}] 清理过小音频失败: {file_path}")
+            return None
+
+        result = await self.asr.transcribe_local_file_verbose(file_path)
+        text = (result or {}).get("text", "")
+        if text:
+            preview = text[:120].replace("\n", " ").strip()
+            logger.info(f"[{bvid}] Recognition ASR 成功，长度={len(text)}，预览：{preview}")
+        return result
+
+    def _transcode_audio_to_wav(self, bvid: str, file_path: str) -> Optional[str]:
+        """使用 ffmpeg 转码为 16k 单声道 wav，提高 ASR 兼容性"""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            logger.info(f"[{bvid}] 未检测到 ffmpeg，跳过转码")
+            return None
+
+        base, _ext = os.path.splitext(file_path)
+        wav_path = base + ".wav"
+
+        cmd = [
+            ffmpeg,
+            "-y",
+            "-i", file_path,
+            "-ac", "1",
+            "-ar", "16000",
+            "-vn",
+            wav_path,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                err = (result.stderr or "").strip()
+                logger.info(f"[{bvid}] ffmpeg 转码失败: {err[:300]}")
+                return None
+        except Exception as e:
+            logger.info(f"[{bvid}] ffmpeg 转码异常: {e}")
+            return None
+
+        if not os.path.exists(wav_path) or os.path.getsize(wav_path) < 1024:
+            logger.info(f"[{bvid}] 转码输出过小，跳过使用 wav")
+            return None
+
+        logger.info(f"[{bvid}] 转码完成，使用 wav 上传: {wav_path}")
+        return wav_path
+
+    def _get_audio_duration_sec(self, file_path: str) -> Optional[float]:
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        cmd = [
+            ffprobe,
+            "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1",
+            file_path,
+        ]
+        try:
+            result = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            if result.returncode != 0:
+                return None
+            value = (result.stdout or "").strip()
+            return float(value) if value else None
+        except Exception:
+            return None
+
+    def _split_audio_wav(self, bvid: str, wav_path: str, segment_seconds: int = 1200) -> list[str]:
+        """将较长 wav 切分为多段，提升 ASR 成功率"""
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            logger.info(f"[{bvid}] 未检测到 ffmpeg，跳过切分")
+            return [wav_path]
+
+        duration = self._get_audio_duration_sec(wav_path)
+        if not duration or duration <= segment_seconds:
+            return [wav_path]
+
+        total_segments = int(math.ceil(duration / segment_seconds))
+        logger.info(f"[{bvid}] 音频较长({duration:.1f}s)，切分为 {total_segments} 段")
+
+        base, _ext = os.path.splitext(wav_path)
+        segment_paths: list[str] = []
+        for idx in range(total_segments):
+            start = idx * segment_seconds
+            out_path = f"{base}_part{idx+1:03d}.wav"
+            cmd = [
+                ffmpeg,
+                "-y",
+                "-i", wav_path,
+                "-ss", str(start),
+                "-t", str(segment_seconds),
+                "-ac", "1",
+                "-ar", "16000",
+                "-vn",
+                out_path,
+            ]
+            try:
+                result = subprocess.run(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                if result.returncode != 0:
+                    err = (result.stderr or "").strip()
+                    logger.info(f"[{bvid}] 切分失败: {err[:300]}")
+                    continue
+            except Exception as e:
+                logger.info(f"[{bvid}] 切分异常: {e}")
+                continue
+
+            if os.path.exists(out_path) and os.path.getsize(out_path) >= 1024:
+                segment_paths.append(out_path)
+
+        if not segment_paths:
+            return [wav_path]
+
+        try:
+            os.remove(wav_path)
+        except Exception:
+            logger.debug(f"[{bvid}] 清理原始 wav 失败: {wav_path}")
+
+        return segment_paths
+
+    async def _try_ai_summary(
+        self, 
+        bvid: str, 
+        cid: int, 
+        up_mid: int = None
+    ) -> Optional[dict]:
+        """尝试获取 AI 摘要"""
+        try:
+            result = await self.bili.get_video_summary(bvid, cid, up_mid)
+            
+            if not result:
+                return None
+            
+            # 检查是否有有效摘要
+            inner_code = result.get("code", -1)
+            if inner_code != 0:
+                logger.debug(f"[{bvid}] AI 摘要不可用: code={inner_code}")
+                return None
+            
+            model_result = result.get("model_result", {})
+            summary = model_result.get("summary", "")
+            
+            if not summary:
+                logger.debug(f"[{bvid}] AI 摘要为空")
+                return None
+            
+            # 解析分段提纲
+            outline = []
+            for item in model_result.get("outline", []):
+                outline_item = {
+                    "title": item.get("title", ""),
+                    "timestamp": item.get("timestamp", 0),
+                    "points": []
+                }
+                for point in item.get("part_outline", []):
+                    outline_item["points"].append({
+                        "content": point.get("content", ""),
+                        "timestamp": point.get("timestamp", 0)
+                    })
+                outline.append(outline_item)
+            
+            return {
+                "summary": summary,
+                "outline": outline
+            }
+            
+        except Exception as e:
+            logger.warning(f"[{bvid}] 获取 AI 摘要失败: {e}")
+            return None
+    
+    async def _try_subtitle(self, bvid: str, cid: int, video_info: Optional[dict] = None) -> Optional[dict]:
+        """尝试获取字幕"""
+        try:
+            def pick_subtitle(subtitles: list) -> Optional[dict]:
+                """优先选中文且人工字幕，没有就回退到中文自动字幕"""
+                if not subtitles:
+                    return None
+                def is_zh(sub):
+                    lan = sub.get("lan", "") or ""
+                    return "zh" in lan.lower() or "cn" in lan.lower()
+                for sub in subtitles:
+                    if is_zh(sub) and str(sub.get("ai_status", "0")) == "0":
+                        return sub
+                for sub in subtitles:
+                    if is_zh(sub):
+                        return sub
+                return subtitles[0]
+
+            def sort_subtitles(subtitles: list) -> list[dict]:
+                if not subtitles:
+                    return []
+
+                def score(sub: dict) -> tuple[int, int]:
+                    lan = ((sub or {}).get("lan") or "").lower()
+                    is_zh = 1 if ("zh" in lan or "cn" in lan) else 0
+                    is_manual = 1 if str((sub or {}).get("ai_status", "0")) == "0" else 0
+                    return (is_zh, is_manual)
+
+                ordered = []
+                seen = set()
+                primary = pick_subtitle(subtitles)
+                for sub in ([primary] if primary else []) + sorted(
+                    [item for item in subtitles if isinstance(item, dict)],
+                    key=score,
+                    reverse=True,
+                ):
+                    subtitle_url = extract_url(sub)
+                    if not subtitle_url or subtitle_url in seen:
+                        continue
+                    seen.add(subtitle_url)
+                    ordered.append(sub)
+                return ordered
+
+            def extract_subtitles(data: dict) -> list:
+                payload = data or {}
+                subtitle_block = payload.get("subtitle", {}) or {}
+                return (
+                    subtitle_block.get("subtitles")
+                    or subtitle_block.get("list")
+                    or payload.get("subtitles")
+                    or payload.get("list")
+                    or []
+                )
+
+            def extract_url(sub: dict) -> str:
+                if not isinstance(sub, dict):
+                    return ""
+                return (
+                    sub.get("subtitle_url")
+                    or sub.get("url")
+                    or sub.get("subtitle", {}).get("url")
+                    or ""
+                )
+
+            async def try_download_candidates(subtitles: list, label: str) -> Optional[dict]:
+                candidates = sort_subtitles(subtitles)
+                if not candidates:
+                    return None
+
+                langs = [
+                    f"{(item.get('lan') or 'unknown')}:{'manual' if str(item.get('ai_status', '0')) == '0' else 'auto'}"
+                    for item in candidates
+                ]
+                logger.info(f"[{bvid}] {label} 字幕候选={langs}")
+
+                for idx, selected_subtitle in enumerate(candidates, start=1):
+                    subtitle_url = extract_url(selected_subtitle)
+                    if not subtitle_url:
+                        logger.info(f"[{bvid}] {label} 第{idx}个字幕地址为空，跳过")
+                        continue
+
+                    segments = await self.bili.download_subtitle_segments(subtitle_url)
+                    subtitle_text = self._segments_to_text(segments)
+                    if subtitle_text and len(subtitle_text) >= 50:
+                        preview = subtitle_text[:120].replace("\n", " ").strip()
+                        logger.info(
+                            f"[{bvid}] 字幕获取成功({label}#{idx})，长度={len(subtitle_text)}，预览：{preview}"
+                        )
+                        return {"text": subtitle_text, "segments": segments}
+
+                    logger.info(
+                        f"[{bvid}] {label} 第{idx}个字幕不可用，segments={len(segments)} "
+                        f"text_len={len(subtitle_text) if subtitle_text else 0}"
+                    )
+                return None
+
+            cookies = self.bili._get_cookies()
+            has_login = bool(cookies.get("SESSDATA"))
+
+            # 第一次尝试：播放器接口
+            aid = video_info.get("aid") if video_info else None
+            player_info = await self.bili.get_player_info(bvid, cid, aid=aid)
+
+            subtitles = extract_subtitles(player_info or {})
+            if subtitles:
+                result = await try_download_candidates(subtitles, "播放器")
+                if result:
+                    return result
+            else:
+                logger.info(f"[{bvid}] 播放器字幕为空（登录态={'已设置' if has_login else '未设置'}）")
+
+            # 如果没有 video_info，尝试获取以补齐 aid 与字幕列表
+            if not video_info:
+                try:
+                    video_info = await self.bili.get_video_info(bvid)
+                except Exception as e:
+                    logger.debug(f"[{bvid}] 获取视频信息失败(字幕兜底): {e}")
+                    video_info = None
+
+            # 第二次尝试：带 aid 再取一次播放器字幕
+            if video_info and not aid:
+                aid = video_info.get("aid")
+                if aid:
+                    player_info = await self.bili.get_player_info(bvid, cid, aid=aid)
+                    subtitles = extract_subtitles(player_info or {})
+                    if subtitles:
+                        result = await try_download_candidates(subtitles, "播放器补aid")
+                        if result:
+                            return result
+                    else:
+                        logger.info(f"[{bvid}] 播放器字幕仍为空（aid 已补齐）")
+
+            # 最后兜底：从 view 接口的字幕列表里取
+            view_subtitles = (video_info or {}).get("subtitle", {}).get("list") or []
+            if view_subtitles:
+                result = await try_download_candidates(view_subtitles, "view兜底")
+                if result:
+                    return result
+            else:
+                logger.info(f"[{bvid}] view 字幕列表为空，无法兜底")
+
+            logger.info(f"[{bvid}] 没有可用字幕，回退到简介兜底")
+            return None
+            
+        except Exception as e:
+            logger.warning(f"[{bvid}] 获取字幕失败: {e}")
+            return None
+    
+    async def fetch_all_videos_content(
+        self, 
+        videos: list, 
+        progress_callback=None
+    ) -> list[VideoContent]:
+        """
+        批量获取视频内容
+        
+        Args:
+            videos: 视频列表，每个元素需包含 bvid, title (可选 cid)
+            progress_callback: 进度回调函数 callback(current, total, video_title)
+            
+        Returns:
+            VideoContent 列表
+        """
+        import asyncio
+        
+        results = []
+        total = len(videos)
+        
+        for i, video in enumerate(videos):
+            bvid = video.get("bvid") or video.get("bv_id")
+            title = video.get("title", "")
+            cid = video.get("cid") or video.get("id")
+            
+            if not bvid:
+                logger.warning(f"跳过无效视频: {video}")
+                continue
+            
+            try:
+                content = await self.fetch_content(bvid, cid, title)
+                results.append(content)
+                
+                if progress_callback:
+                    progress_callback(i + 1, total, title)
+                    
+            except Exception as e:
+                logger.error(f"处理视频失败 [{bvid}]: {e}")
+                results.append(VideoContent(
+                    bvid=bvid,
+                    title=title or bvid,
+                    content=f"处理失败: {str(e)}",
+                    source=ContentSource.BASIC_INFO
+                ))
+            
+            # 控制请求速率
+            await asyncio.sleep(0.5)
+        
+        return results
