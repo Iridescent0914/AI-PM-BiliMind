@@ -1,6 +1,6 @@
 # Bilibili-RAG：早期架构构想（非当前实现）
 
-> 历史设计草案，仅供方案讨论。文中的“当前能力”“已完成”标记和简历表述不代表实际实现。真实状态请以 [README](README.md) 与 [产品计划](PRODUCT_PLAN.md) 为准。
+> 历史设计草案，仅供方案讨论。文中的“当前能力”“已完成”标记和简历表述不代表实际实现。真实状态请以 [README](README.md) 与 [产品计划](01PRODUCT_PLAN.md) 为准。
 
 > 基于自适应检索与证据验证的视频知识库 Agentic RAG 系统  
 > **Evidence-Grounded Adaptive Agentic RAG for Video Knowledge Bases**
