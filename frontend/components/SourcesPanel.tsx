@@ -196,14 +196,14 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
       totalCount = status.media_count;
     }
 
-    // 未入库：从未同步过
+    // 未同步：从未同步过收藏夹视频关联
     if (!lastSync) {
-      return { label: "未入库", className: "empty", indexedCount };
+      return { label: "未同步", className: "empty", indexedCount };
     }
 
-    // 已入库：有同步时间
+    // 这里只统计收藏夹视频关联，不代表内容与向量都已处理
     if (indexedCount >= totalCount) {
-      return { label: "已入库", className: "ok", indexedCount, totalCount };
+      return { label: "已同步", className: "ok", indexedCount, totalCount };
     }
 
     // 有更新：B站收藏夹比本地多
@@ -211,8 +211,8 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
       return { label: "有更新", className: "partial", indexedCount, totalCount };
     }
 
-    // 已入库但视频数为0（可能视频都没有内容）
-    return { label: "已入库", className: "ok", indexedCount, totalCount };
+    // 已同步但视频数为 0
+    return { label: "已同步", className: "ok", indexedCount, totalCount };
   };
 
   // 计算按钮文字
@@ -286,7 +286,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
                       <div className="folder-meta">
                         <div className="folder-title" title={f.title}>{f.title}</div>
                       <div className="folder-count">
-                        {status.indexedCount}/{status.totalCount ?? f.media_count} 个视频
+                        已同步 {status.indexedCount}/{status.totalCount ?? f.media_count} 个视频
                         {lastSync && ` · ${lastSync}`}
                       </div>
                       </div>
@@ -350,7 +350,7 @@ export default function SourcesPanel({ sessionId, onBuildDone, onSelectionChange
         </button>
 
         <p className="text-xs text-[var(--muted)] text-center mt-2">
-          入库后可在右侧进行问答
+          内容处理完成后可在右侧进行问答
         </p>
       </div>
 

@@ -352,9 +352,10 @@ def _pick_artifact_summary(
         if fallback_summary:
             return fallback_summary, _dedupe_key_points(fallback_summary, fallback_points)
 
-    fallback_summary, fallback_points = _build_summary_fallback(content_text, outline_json)
-    if fallback_summary:
-        return fallback_summary, _dedupe_key_points(fallback_summary, fallback_points)
+    if source in (ContentSource.SUBTITLE.value, ContentSource.ASR.value):
+        fallback_summary, fallback_points = _build_summary_fallback(content_text, outline_json)
+        if fallback_summary:
+            return fallback_summary, _dedupe_key_points(fallback_summary, fallback_points)
 
     return None, []
 
@@ -647,6 +648,7 @@ async def _sync_folder(
     targets = list(added) + list(update_candidates)
     total_targets = len(targets)
     processed_targets = 0
+    failed_targets = 0
     if progress_callback:
         progress_callback("准备处理", processed_targets, total_targets)
     for bvid in targets:
@@ -666,6 +668,7 @@ async def _sync_folder(
                 logger.warning(f"[{bvid}] 补齐权威视频信息失败: {e}")
         
         # 尝试添加到向量库（可能失败，但不影响记录入库）
+        cache = None
         try:
             global_count = await db.scalar(
                 select(func.count()).select_from(FavoriteVideo).where(FavoriteVideo.bvid == bvid)
@@ -779,8 +782,14 @@ async def _sync_folder(
                 logger.info(f"[{bvid}] 向量化完成，块数={chunks}")
             else:
                 logger.info(f"[{bvid}] 内容未变化或无需升级，跳过向量化")
+            if cache:
+                cache.process_error = None
         except Exception as e:
-            logger.warning(f"添加向量失败 [{bvid}]: {e} (仍会记录到数据库)")
+            failed_targets += 1
+            if cache:
+                cache.is_processed = False
+                cache.process_error = str(e)
+            logger.warning(f"视频内容处理失败 [{bvid}]: {e} (收藏关联仍会记录到数据库)")
         
         # 无论向量是否添加成功，都写入 FavoriteVideo 记录
         try:
@@ -838,7 +847,8 @@ async def _sync_folder(
         "added": len(added),
         "removed": len(removed),
         "indexed": indexed_count or 0,
-        "message": "同步完成",
+        "failed": failed_targets,
+        "message": f"同步完成，{failed_targets} 条内容处理失败" if failed_targets else "同步完成",
         "last_sync_at": folder.last_sync_at,
     }
 
@@ -1130,6 +1140,7 @@ async def _build_knowledge_base_task(
             processed = 0
             total_added = 0
             total_removed = 0
+            total_failed = 0
 
             async with get_db_context() as db:
                 for idx, folder_id in enumerate(folder_ids, start=1):
@@ -1160,14 +1171,22 @@ async def _build_knowledge_base_task(
                     processed = idx
                     total_added += result["added"]
                     total_removed += result["removed"]
+                    total_failed += result.get("failed", 0)
 
             build_tasks[task_id]["status"] = "completed"
             build_tasks[task_id]["progress"] = 100
             build_tasks[task_id]["processed_videos"] = total_folders
             build_tasks[task_id]["current_step"] = "完成"
-            build_tasks[task_id]["message"] = f"同步完成：新增 {total_added}，移除 {total_removed}"
+            build_tasks[task_id]["message"] = (
+                f"同步完成：新增 {total_added}，移除 {total_removed}；"
+                f"{total_failed} 条内容处理失败，请检查模型配置与后端日志"
+                if total_failed else f"同步完成：新增 {total_added}，移除 {total_removed}"
+            )
 
-            logger.info(f"知识库构建完成: 新增 {total_added}，移除 {total_removed}")
+            logger.info(
+                f"知识库同步结束: 新增 {total_added}，移除 {total_removed}，"
+                f"内容处理失败 {total_failed}"
+            )
         finally:
             await bili.close()
 

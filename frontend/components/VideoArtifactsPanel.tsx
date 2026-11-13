@@ -35,6 +35,16 @@ function truncate(value: string, max: number) {
   return value.length > max ? `${value.slice(0, max)}...` : value;
 }
 
+function sourceLabel(source?: string) {
+  const labels: Record<string, string> = {
+    subtitle: "subtitle（字幕）",
+    asr: "asr（语音转写）",
+    ai_summary: "ai_summary（B 站摘要）",
+    basic_info: "basic_info（仅标题/简介）",
+  };
+  return source ? labels[source] || source : "unknown（内容未处理）";
+}
+
 function normalizeRelation(item: VideoArtifactItem): RelationItem[] {
   return Array.from(
     new Map(
@@ -324,7 +334,7 @@ export default function VideoArtifactsPanel({ sessionId, folderIds, refreshKey }
                     {item.title}
                   </a>
                   <div className="artifact-meta">
-                    {item.source || "unknown"}
+                    {sourceLabel(item.source)}
                     {item.transcript_segment_count > 0 ? ` · ${item.transcript_segment_count} 段文字稿` : ""}
                   </div>
                 </div>
@@ -332,7 +342,7 @@ export default function VideoArtifactsPanel({ sessionId, folderIds, refreshKey }
                 {item.summary ? <p className="artifact-summary">{item.summary}</p> : null}
 
                 {!item.summary && item.entities.length === 0 && item.relations.length === 0 ? (
-                  <p className="artifact-summary">这条视频的摘要与知识图谱还在生成或回填中，刷新页面后会自动显示。</p>
+                  <p className="artifact-summary">暂无可展示的摘要或知识图谱。若左侧仍在入库，请等待任务完成；若已完成，可查看内容来源并点击「更新」重试。刷新页面只会重新读取现有结果。</p>
                 ) : null}
 
                 {item.key_points.length > 0 ? (

@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     
     # 应用配置
     app_host: str = Field(default="0.0.0.0", env="APP_HOST")
-    app_port: int = Field(default=8000, env="APP_PORT")
+    app_port: int = Field(default=8001, env="APP_PORT")
     debug: bool = Field(default=True, env="DEBUG")
     
     # 数据库

@@ -52,10 +52,12 @@ B 站扫码登录
 
 1. 安装 Python 依赖：`pip install -r requirements.txt`。
 2. 在 PowerShell 中执行 `Copy-Item .env.example .env`，填写 `DASHSCOPE_API_KEY`。首次试跑先保留示例中的模型和 API 地址，以便记录固定基线；本地音频 ASR 兜底依赖系统安装的 `ffmpeg`。`.env` 和本地数据目录已被 Git 忽略，不要把 Key、Cookie 或数据库提交到仓库。
-3. 启动后端：`python -m uvicorn app.main:app --reload`。默认地址为 `http://localhost:8000`，接口文档在 `/docs`。
-4. 进入 `frontend`，执行 `npm ci` 和 `npm run dev`。默认前端地址为 `http://localhost:3000`；如后端地址不同，设置 `NEXT_PUBLIC_API_URL`。
+3. 启动后端：`python -m uvicorn app.main:app --host 127.0.0.1 --port 8001 --reload`。项目 API 地址为 `http://127.0.0.1:8001`，接口文档在 `/docs`。
+4. 进入 `frontend`，执行 `npm ci` 和 `npm run dev`。默认前端地址为 `http://localhost:3000`，默认连接 `http://127.0.0.1:8001`；如后端地址不同，设置 `NEXT_PUBLIC_API_URL` 并重启前端。
 5. 在页面扫码登录。首次只选择一个较小、包含技术学习视频的收藏夹，点击「入库」；此操作会同步收藏夹并处理视频内容，进度在页面显示。当前页面按收藏夹选择，尚不能在页面中只勾选其中几条视频。先不要一次处理全部收藏夹：逐视频的转写、摘要和知识图谱生成可能需要较长时间与多次模型调用。
 6. 完成后抽查 3–5 条视频：在视频产物卡片上确认标题、内容来源（字幕/ASR/摘要/标题简介）、文字稿段数和摘要；在问答来源中核查有无可跳转时间戳。分别试问“某主题出现在哪些收藏视频及片段”和“请概括一条视频的主要内容”；把输入、预期视频/片段、实际回答、缺失信息、耗时记录到 [个人任务记录](02USER_RESEARCH.md)。当前摘要和问答不等于完整笔记，结果应作为 P0 基线保存。
+
+如果收藏夹显示已同步，但视频产物是 `unknown` 或 `basic_info`，检查后端日志里的内容获取和模型调用错误。`unknown` 表示内容来源尚未写入缓存；`basic_info` 表示只有标题、简介等基础信息。模型服务返回 `401 invalid_api_key` 时，核对 `.env` 的 `DASHSCOPE_API_KEY` 与服务地域、API 地址是否匹配，重启后端，再先选择一个小收藏夹点击「更新」验证。不要将 Key 或 B 站 Cookie 发给他人。收藏夹中的视频关联数量不等于完成内容处理或向量索引的视频数量。
 
 ## 已知限制与待验证事项
 

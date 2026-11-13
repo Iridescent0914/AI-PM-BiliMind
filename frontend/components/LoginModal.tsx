@@ -11,17 +11,22 @@ interface Props {
 
 export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
   const [qr, setQr] = useState<QRCodeResponse | null>(null);
-  const [status, setStatus] = useState<"loading" | "ready" | "scanned" | "success" | "error">("loading");
+  const [status, setStatus] = useState<"loading" | "ready" | "scanned" | "success" | "expired" | "error">("loading");
   const [polling, setPolling] = useState(false);
+  const [errorMessage, setErrorMessage] = useState("");
 
   const getQR = async () => {
+    setPolling(false);
+    setQr(null);
+    setErrorMessage("");
     setStatus("loading");
     try {
       const data = await authApi.getQRCode();
       setQr(data);
       setStatus("ready");
       setPolling(true);
-    } catch {
+    } catch (error) {
+      setErrorMessage(error instanceof Error ? error.message : "无法连接二维码服务");
       setStatus("error");
     }
   };
@@ -36,9 +41,14 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
 
   useEffect(() => {
     if (!polling || !qr) return;
+    let active = true;
+    let inFlight = false;
     const timer = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const res = await authApi.pollQRCode(qr.qrcode_key);
+        if (!active) return;
         if (res.status === "scanned") setStatus("scanned");
         else if (res.status === "confirmed") {
           setPolling(false);
@@ -46,11 +56,21 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
           setTimeout(() => onSuccess(res.session_id!, res.user_info!), 500);
         } else if (res.status === "expired") {
           setPolling(false);
-          setStatus("error");
+          setStatus("expired");
         }
-      } catch { }
+      } catch (error) {
+        if (!active) return;
+        setPolling(false);
+        setErrorMessage(error instanceof Error ? error.message : "无法查询扫码状态");
+        setStatus("error");
+      } finally {
+        inFlight = false;
+      }
     }, 2000);
-    return () => clearInterval(timer);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
   }, [polling, qr, onSuccess]);
 
   if (!isOpen) return null;
@@ -87,9 +107,14 @@ export default function LoginModal({ isOpen, onClose, onSuccess }: Props) {
             </div>
           )}
 
-          {status === "error" && (
+          {(status === "expired" || status === "error") && (
             <div className="w-48 h-48 flex flex-col items-center justify-center">
-              <p className="text-sm text-[var(--muted)] mb-3">二维码已过期</p>
+              <p className="text-sm text-[var(--muted)] mb-3 text-center">
+                {status === "expired" ? "二维码已过期" : "二维码请求失败"}
+              </p>
+              {status === "error" && errorMessage && (
+                <p className="text-xs text-[var(--muted)] mb-3 break-all text-center">{errorMessage}</p>
+              )}
               <button onClick={getQR} className="btn btn-primary">重新获取</button>
             </div>
           )}
