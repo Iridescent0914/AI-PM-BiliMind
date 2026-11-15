@@ -177,6 +177,7 @@ export default function Home() {
 
             <section className="panel panel-chat" style={{ flex: 1 }}>
               <ChatPanel
+                key={session}
                 statsKey={statsKey}
                 sessionId={session ?? undefined}
                 folderIds={selectedFolderIds}

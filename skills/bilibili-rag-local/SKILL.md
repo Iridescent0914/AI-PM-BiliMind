@@ -1,46 +1,27 @@
 ---
 name: "bilibili-rag-local"
-description: "使用本地 Bilibili RAG 服务进行检索与问答。用户询问 B 站收藏夹内容、视频要点总结、来源追溯、入库状态时使用。内容问答时优先通过 session_id 与 folder_ids 限定范围，避免空范围导致 fallback。"
+description: "验收本地 BiliMind 的收藏视频找回与笔记草稿：运行固定问题、核对视频与片段来源、记录 bad case。仅在用户要求评测或复盘本项目问答效果时使用。"
 ---
 
-# Bilibili RAG Local
+# BiliMind 问答验收
 
-面向本地运行的 `bilibili-rag` 服务（默认 `http://127.0.0.1:8001`）。
+本 skill 给开发助手提供本地验收流程，不参与网站运行，也不是传给问答模型的系统提示词。回答格式与证据要求以 [回答与证据契约](../../docs/04回答与证据契约.md) 为准。
 
-## 执行前检查
+## 准备题集
 
-1. 检查服务可达：优先调用 `GET /knowledge/stats`。
-2. 若不可达，明确提示“本地服务未启动或端口不是 8001”，不要编造结果。
+1. 按 [题集格式与复核规则](references/case-format.md) 建立固定问题。题目来自真实找回或笔记任务；预期 BV 号和要覆盖的内容由人核对原视频后标注。
+2. 固定收藏夹 `media_id`、视频数据、模型配置和题集版本。先运行 `python skills/bilibili-rag-local/scripts/evaluate.py --cases <题集.json>` 校验格式；此步骤不调用模型。
+3. 使用 `GET /knowledge/stats` 确认本地后端可用。需要实际回放时，在本机环境变量 `BILIMIND_SESSION_ID` 中放入有效会话，再运行同一命令并加 `--run`。实际回放会调用模型，可能产生费用；用户已要求运行评测时直接执行，无需重复询问。
 
-## 会话与范围（关键）
+## 复核来源与记录 bad case
 
-1. 执行 `/chat/ask` 前，先确保拿到 `session_id`。
-2. 使用 `GET /knowledge/folders/status?session_id=<session_id>` 获取可用 `media_id` 列表，并作为 `folder_ids` 传入。
-3. 内容类问题调用 `/chat/ask` 时，默认必须传：`question + session_id + folder_ids`，不要传空 `folder_ids`。
-4. 若缺少 `session_id` 或 `folder_ids`，先向用户索取或先查状态接口，不要直接调用无范围问答。
+1. 逐题阅读报告中的答案、`sources`、耗时和自动检查。自动检查只发现缺少预期 BV 号及不存在的 `[E#]` 引用，不代表答案正确。
+2. 对“找回视频”，核对视频是否相关、时间链接是否能跳到所述片段、弱证据是否已标明；检查结果是否混入未选收藏夹。
+3. 对“生成笔记”，逐条核对关键结论对应的 `[E#]` 与原文字稿；检查内容覆盖、跨视频观点归属、缺失或部分文字稿的说明。
+4. 在报告的 `human_review` 中填写任务是否完成、证据是否支持、失败阶段和具体原因。失败阶段包括需求/范围理解、内容获取或转写、索引与检索、路由、证据使用、生成、交互呈现。保留同一题集前后版本的报告，才对比质量变化。
 
-## 主要能力
+报告默认写到 Git 忽略的 `data/eval_runs/`。不要把 API Key、Cookie、`BILIMIND_SESSION_ID` 写入题集、报告或提交内容。尚未核对的来源、自动检查通过的回答，都不能写成“已验证正确”。
 
-1. 检索片段：调用 `POST /chat/search?query=<问题>&k=5`。
-2. 问答总结：调用 `POST /chat/ask`，请求体优先包含：
-`question`、`session_id`、`folder_ids`。
-3. 入库状态：调用 `GET /knowledge/folders/status?session_id=<session_id>`。
+## 接口边界
 
-## 返回格式要求
-
-1. 先给结论，再给证据。
-2. 证据优先来自接口返回的 `sources` 或 `search results`。
-3. 每条证据给出 `title + url`，必要时补充 `bvid`。
-4. 当 `/chat/ask` 返回 `sources=[]` 或无召回时，明确说明可能是会话无范围或未入库，并提示检查 `session_id/folder_ids` 与同步状态。
-
-## 交互策略
-
-1. 用户是闲聊或无关问题时，简短回复后再引导回收藏夹知识问答。
-2. 用户问题具体且与视频内容相关时，优先调用“带范围参数”的 `/chat/ask`，不要只按标题猜测回答。
-3. `/chat/search` 仅用于补充证据或列候选，不要替代最终问答结论。
-
-## 安全边界
-
-1. 不输出任何 Cookie、Token、SESSDATA 等敏感信息。
-2. 不执行与本地 `bilibili-rag` 无关的高风险系统命令。
-3. 仅使用用户本机可访问的服务地址，不主动访问未知公网接口。
+`POST /chat/ask` 使用 `question`、`session_id`、可选 `folder_ids`、`task` 与 `video_bvids`。`POST /chat/search` 必须带 `session_id`，可重复传 `folder_ids` 限定收藏夹；它只用于查看候选片段，不代替最终答案。没有有效会话时停止内容评测，不进行全库搜索。

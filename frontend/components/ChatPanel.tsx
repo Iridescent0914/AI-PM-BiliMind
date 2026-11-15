@@ -1,15 +1,15 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useRef, useEffect, useLayoutEffect } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { chatApi, knowledgeApi, KnowledgeStats, API_BASE_URL } from "@/lib/api";
+import { chatApi, knowledgeApi, KnowledgeStats, ChatSource, API_BASE_URL } from "@/lib/api";
 
 interface Message {
   id: string;
   role: "user" | "assistant";
   content: string;
-  sources?: Array<{ bvid: string; title: string; url: string; start_sec?: number; end_sec?: number; timestamp?: string }>;
+  sources?: ChatSource[];
 }
 
 interface Props {
@@ -23,21 +23,85 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [stats, setStats] = useState<KnowledgeStats | null>(null);
-  const endRef = useRef<HTMLDivElement>(null);
+  const [loadedStorageKey, setLoadedStorageKey] = useState<string | null>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const shouldFollowRef = useRef(true);
   const marker = "[[SOURCES_JSON]]";
+  const sourceLabels: Record<string, string> = {
+    subtitle: "字幕",
+    asr: "语音转写",
+    ai_summary: "AI 摘要（弱证据）",
+    basic_info: "标题/简介（弱证据）",
+    unknown: "来源未确认",
+  };
+  const storageKey = sessionId ? `bilimind_chat_messages:${sessionId}` : null;
+
+  useEffect(() => {
+    if (!storageKey) {
+      setMessages([]);
+      setLoadedStorageKey(null);
+      return;
+    }
+
+    try {
+      const saved = window.localStorage.getItem(storageKey);
+      const parsed: unknown = saved ? JSON.parse(saved) : [];
+      setMessages(
+        Array.isArray(parsed) && parsed.every((message) =>
+          message && typeof message.id === "string" &&
+          (message.role === "user" || message.role === "assistant") &&
+          typeof message.content === "string"
+        ) ? parsed : []
+      );
+    } catch {
+      setMessages([]);
+    }
+    setLoadedStorageKey(storageKey);
+  }, [storageKey]);
+
+  useEffect(() => {
+    if (!storageKey || loadedStorageKey !== storageKey) return;
+    try {
+      window.localStorage.setItem(storageKey, JSON.stringify(messages));
+    } catch {
+      // 浏览器禁用本地存储或空间不足时，仍允许继续对话。
+    }
+  }, [messages, storageKey, loadedStorageKey]);
 
   useEffect(() => {
     knowledgeApi.getStats().then(setStats).catch(() => { });
   }, [statsKey]);
 
-  useEffect(() => {
-    endRef.current?.scrollIntoView({ behavior: "smooth" });
+  useLayoutEffect(() => {
+    const scrollElement = scrollRef.current;
+    if (scrollElement && shouldFollowRef.current) {
+      scrollElement.scrollTop = scrollElement.scrollHeight;
+    }
   }, [messages]);
+
+  const handleChatScroll = () => {
+    const scrollElement = scrollRef.current;
+    if (!scrollElement) return;
+    const distanceFromBottom = scrollElement.scrollHeight - scrollElement.scrollTop - scrollElement.clientHeight;
+    shouldFollowRef.current = distanceFromBottom < 24;
+  };
+
+  const clearMessages = () => {
+    if (storageKey) {
+      try {
+        window.localStorage.removeItem(storageKey);
+      } catch {
+        // 浏览器禁用本地存储时，仍清空当前页面。
+      }
+    }
+    setMessages([]);
+  };
 
   const send = async () => {
     if (!input.trim() || loading) return;
     const q = input.trim();
     setInput("");
+    shouldFollowRef.current = true;
     const userId = Date.now().toString();
     const assistantId = (Date.now() + 1).toString();
     setMessages((prev) => [
@@ -146,14 +210,14 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
           )}
         </div>
         {messages.length > 0 && (
-          <button onClick={() => setMessages([])} className="btn btn-ghost" title="清空">
+          <button onClick={clearMessages} className="btn btn-ghost" title="清空">
             清空对话
           </button>
         )}
       </div>
 
       <div className="panel-body">
-        <div className="chat-scroll">
+        <div className="chat-scroll" ref={scrollRef} onScroll={handleChatScroll}>
           {messages.length === 0 ? (
             <div className="empty-state">
               <div>
@@ -187,7 +251,7 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
                       <div className="source-list">
                         {m.sources.map((s, i) => (
                           <a key={i} href={s.url} target="_blank" rel="noopener noreferrer" className="source-link">
-                            {s.title}{s.timestamp ? ` · ${s.timestamp}` : ""}
+                            {s.evidence_id ? `[${s.evidence_id}] ` : ""}{s.title}{s.timestamp ? ` · ${s.timestamp}` : ""}{s.content_source ? ` · ${sourceLabels[s.content_source] || s.content_source}` : ""}
                           </a>
                         ))}
                       </div>
@@ -206,7 +270,6 @@ export default function ChatPanel({ statsKey, sessionId, folderIds }: Props) {
                   </div>
                 </div>
               )}
-              <div ref={endRef} />
             </div>
           )}
         </div>

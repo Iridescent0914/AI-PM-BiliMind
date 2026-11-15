@@ -8,7 +8,7 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from sqlalchemy.orm import sessionmaker
 from datetime import datetime
-from typing import Optional
+from typing import Literal, Optional
 from pydantic import BaseModel
 from enum import Enum
 
@@ -170,6 +170,8 @@ class ChatRequest(BaseModel):
     question: str
     session_id: Optional[str] = None
     folder_ids: Optional[list[int]] = None  # 指定收藏夹，None 表示全部
+    task: Literal["auto", "find", "note"] = "auto"
+    video_bvids: Optional[list[str]] = None  # 笔记目标视频，必须属于选定收藏夹
 
 
 class ChatResponse(BaseModel):

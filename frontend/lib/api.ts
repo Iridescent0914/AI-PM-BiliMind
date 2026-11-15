@@ -165,14 +165,19 @@ export interface VideoArtifactItem {
 
 export interface ChatResponse {
     answer: string;
-    sources: Array<{
-        bvid: string;
-        title: string;
-        url: string;
-        start_sec?: number;
-        end_sec?: number;
-        timestamp?: string;
-    }>;
+    sources: ChatSource[];
+}
+
+export interface ChatSource {
+    bvid: string;
+    title: string;
+    url: string;
+    start_sec?: number;
+    end_sec?: number;
+    timestamp?: string;
+    evidence_id?: string;
+    content_source?: string;
+    evidence_text?: string;
 }
 
 // ==================== API 函数 ====================

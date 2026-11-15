@@ -4,8 +4,9 @@ Bilibili RAG 知识库系统
 """
 import re
 import json
+from dataclasses import dataclass
 from typing import List, Optional
-from fastapi import APIRouter, HTTPException, Depends
+from fastapi import APIRouter, HTTPException, Depends, Query
 from fastapi.responses import StreamingResponse
 from loguru import logger
 from sqlalchemy import select, func, or_
@@ -14,7 +15,7 @@ from openai import OpenAI
 from langchain.schema import Document
 
 from app.database import get_db
-from app.models import ChatRequest, ChatResponse, FavoriteFolder, FavoriteVideo, VideoCache
+from app.models import ChatRequest, ChatResponse, FavoriteFolder, FavoriteVideo, UserSession, VideoCache
 from app.config import settings
 from app.routers.knowledge import get_rag_service
 
@@ -40,7 +41,7 @@ def _build_source_payload(meta: dict) -> dict:
     timestamp_text = meta.get("timestamp_text") or _format_timestamp(start_sec)
     base_url = f"https://www.bilibili.com/video/{bvid}" if bvid else meta.get("url", "")
     url = meta.get("url") or (f"{base_url}?t={max(0, int(start_sec))}" if start_sec is not None else base_url)
-    return {
+    payload = {
         "bvid": bvid,
         "title": title,
         "url": url,
@@ -48,6 +49,18 @@ def _build_source_payload(meta: dict) -> dict:
         "end_sec": end_sec,
         "timestamp": timestamp_text,
     }
+    for key in ("evidence_id", "content_source", "evidence_text"):
+        if meta.get(key) is not None:
+            payload[key] = meta[key]
+    return payload
+
+
+@dataclass
+class PreparedChat:
+    messages: list[dict]
+    sources: list[dict]
+    direct_answer: Optional[str] = None
+    notice: str = ""
 
 def _get_llm_client() -> OpenAI:
     """获取 LLM 客户端"""
@@ -300,10 +313,17 @@ async def _is_related_to_collection(db: AsyncSession, folder_ids: List[int], que
 
 async def _get_folder_ids_for_session(db: AsyncSession, session_id: str, media_ids: Optional[List[int]]) -> List[int]:
     """根据 session 和 media_id 获取内部 folder_id（支持跨 session 查找同用户数据）"""
-    from app.models import UserSession
-    # 1. 尝试获取当前 session 的 mid
-    mid_result = await db.execute(select(UserSession.bili_mid).where(UserSession.session_id == session_id))
-    mid = mid_result.scalar()
+    session_result = await db.execute(
+        select(UserSession).where(
+            UserSession.session_id == session_id,
+            UserSession.is_valid.is_(True),
+        )
+    )
+    session = session_result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=401, detail="未登录或会话已过期")
+
+    mid = session.bili_mid
     target_session_ids = [session_id]
     if mid:
         # 查找该用户所有的 Session ID
@@ -315,13 +335,15 @@ async def _get_folder_ids_for_session(db: AsyncSession, session_id: str, media_i
         .where(FavoriteFolder.session_id.in_(target_session_ids))
         .order_by(FavoriteFolder.updated_at.desc())
     )
-    if media_ids:
-        stmt = stmt.where(FavoriteFolder.media_id.in_(media_ids))
     rows = await db.execute(stmt)
     dedup: dict[int, int] = {}
     for folder_id, media_id, _updated_at in rows.fetchall():
         if media_id not in dedup:
             dedup[media_id] = folder_id
+    if media_ids:
+        if set(media_ids) - set(dedup):
+            raise HTTPException(status_code=403, detail="收藏夹不属于当前用户或尚未入库")
+        return [dedup[media_id] for media_id in dict.fromkeys(media_ids)]
     return list(dedup.values())
 
 async def _get_bvids_by_folder_ids(db: AsyncSession, folder_ids: List[int]) -> List[str]:
@@ -429,14 +451,202 @@ async def _get_video_titles_context(db: AsyncSession, folder_ids: List[int], lim
     context_parts = [f"【{folder_name}】\n" + "\n".join(videos) for folder_name, videos in grouped.items()]
     return "\n\n".join(context_parts)
 
+
+def _resolve_task(request: ChatRequest) -> str:
+    if request.task != "auto":
+        return request.task
+    question = request.question.lower()
+    if any(term in question for term in ("笔记", "复习提纲", "整理成文字", "文字版整理")):
+        return "note"
+    if any(term in question for term in ("找回", "找", "哪个视频", "哪些视频", "哪条视频", "出现在哪", "定位片段")):
+        return "find"
+    return "general"
+
+
+def _build_find_messages(context: str, question: str) -> list[dict]:
+    system = (
+        "你帮助用户从已收藏的视频中找回相关内容。只能使用下方编号证据，不能补充外部知识。\n"
+        "输出格式：\n"
+        "## 找到的收藏视频\n"
+        "逐条写视频标题、与问题相关的具体内容、证据编号 [E#]；只有证据给出时间时才写片段时间。"
+        "相同视频的多个片段可以合并，但保留对应编号。\n"
+        "## 范围与限制\n"
+        "说明证据不足、只有标题简介或没有时间戳的情况。若证据与问题无关，明确说未找到可靠命中。\n"
+        "不得编造视频、BV 号、时间戳或证据编号；仅标题/简介来源必须标明“仅元数据线索”。\n\n"
+        f"编号证据：\n{context}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": question}]
+
+
+def _build_note_messages(context: str, question: str, included: int, total: int) -> list[dict]:
+    partial = included < total
+    title = "部分内容笔记草稿" if partial else "笔记草稿"
+    system = (
+        "你根据用户指定视频的字幕或 ASR 文字稿，写可核对的笔记草稿。只能使用下方编号片段；"
+        "不要根据标题或常识补全未提供的内容。\n"
+        f"本次提供 {included}/{total} 个按时间顺序切分的文字稿片段。\n"
+        f"标题必须包含“{title}”。\n"
+        "输出格式：核心概览；按内容顺序整理的要点；步骤/例子/观点差异（仅有依据时写）；证据与局限。\n"
+        "每个关键事实或观点就近标注真实的 [E#]；多视频时标明各观点所属视频，"
+        "不要把不同视频的观点当成同一个结论。\n"
+        "没有依据的部分省略并在局限中说明；不得编造 BV 号、时间戳或证据编号。\n"
+        + ("片段覆盖不完整，必须在局限中明确说明这是部分内容，不能称为完整视频笔记。\n" if partial else "")
+        + f"\n编号文字稿片段：\n{context}"
+    )
+    return [{"role": "system", "content": system}, {"role": "user", "content": question}]
+
+
+def _group_transcript_segments(transcript: list[dict], max_chars: int = 1500) -> list[dict]:
+    chunks: list[dict] = []
+    texts: list[str] = []
+    start_sec = None
+    end_sec = None
+    length = 0
+    for segment in transcript:
+        content = (segment.get("text") or "").strip()
+        if not content:
+            continue
+        if texts and length + len(content) > max_chars:
+            chunks.append({"text": "\n".join(texts), "start_sec": start_sec, "end_sec": end_sec})
+            texts, start_sec, end_sec, length = [], None, None, 0
+        if not texts:
+            start_sec = segment.get("start")
+        texts.append(content)
+        end_sec = segment.get("end")
+        length += len(content)
+    if texts:
+        chunks.append({"text": "\n".join(texts), "start_sec": start_sec, "end_sec": end_sec})
+    return chunks
+
+
+def _sample_chunks(chunks: list[dict], limit: int) -> list[dict]:
+    if len(chunks) <= limit:
+        return chunks
+    if limit == 1:
+        return [chunks[0]]
+    indices = sorted({round(i * (len(chunks) - 1) / (limit - 1)) for i in range(limit)})
+    return [chunks[index] for index in indices]
+
+
+async def _prepare_find_task(request: ChatRequest, db: AsyncSession) -> PreparedChat:
+    if not request.session_id:
+        raise HTTPException(status_code=401, detail="找回收藏视频需要先登录")
+    folder_ids = await _get_folder_ids_for_session(db, request.session_id, request.folder_ids)
+    bvids = await _get_bvids_by_folder_ids(db, folder_ids)
+    if not bvids:
+        return PreparedChat([], [], "当前范围没有已入库的视频，请先选择并入库收藏夹。")
+
+    docs = get_rag_service().search(request.question, k=8, bvids=bvids)
+    allowed_bvids = set(bvids)
+    context_parts: list[str] = []
+    sources: list[dict] = []
+    seen: set[tuple] = set()
+    for doc in docs:
+        meta = doc.metadata or {}
+        bvid = meta.get("bvid")
+        content = (doc.page_content or "").strip()
+        source_key = (bvid, meta.get("start_sec"), meta.get("end_sec"))
+        if bvid not in allowed_bvids or not content or source_key in seen:
+            continue
+        seen.add(source_key)
+        evidence_id = f"E{len(sources) + 1}"
+        source = _build_source_payload({
+            **meta,
+            "evidence_id": evidence_id,
+            "content_source": meta.get("source") or "unknown",
+            "evidence_text": content,
+        })
+        sources.append(source)
+        time_label = f"，约 {source['timestamp']}" if source.get("timestamp") else "，无片段时间"
+        context_parts.append(
+            f"[{evidence_id}] 《{source['title']}》来源={source['content_source']}{time_label}\n{content}"
+        )
+    if not sources:
+        return PreparedChat([], [], "当前范围没有找到可核对的视频片段；只有基础信息或尚未建立索引的视频可能无法定位。")
+    return PreparedChat(_build_find_messages("\n\n".join(context_parts), request.question), sources)
+
+
+async def _prepare_note_task(request: ChatRequest, db: AsyncSession) -> PreparedChat:
+    if not request.session_id:
+        raise HTTPException(status_code=401, detail="生成收藏视频笔记需要先登录")
+    folder_ids = await _get_folder_ids_for_session(db, request.session_id, request.folder_ids)
+    allowed_bvids = set(await _get_bvids_by_folder_ids(db, folder_ids))
+    requested_bvids = request.video_bvids or re.findall(r"(?i:BV)[0-9A-Za-z]{10}", request.question)
+    selected = list(dict.fromkeys("BV" + bvid[2:] for bvid in requested_bvids))
+    if not selected and len(allowed_bvids) == 1:
+        selected = list(allowed_bvids)
+    if not selected:
+        return PreparedChat([], [], "请先指定要整理的 1–3 条收藏视频（可在问题中写 BV 号）；当前不会把整个收藏夹误作单视频笔记。")
+    if len(selected) > 3:
+        raise HTTPException(status_code=422, detail="一次最多整理 3 条视频")
+    if set(selected) - allowed_bvids:
+        raise HTTPException(status_code=403, detail="指定视频不属于当前收藏夹范围")
+
+    result = await db.execute(select(VideoCache).where(VideoCache.bvid.in_(selected)))
+    caches = {video.bvid: video for video in result.scalars().all()}
+    grouped: list[tuple[VideoCache, list[dict]]] = []
+    missing: list[str] = []
+    for bvid in selected:
+        video = caches.get(bvid)
+        if not video or video.content_source not in ("subtitle", "asr") or not isinstance(video.transcript_json, list):
+            missing.append(bvid)
+            continue
+        chunks = _group_transcript_segments(video.transcript_json)
+        if not chunks:
+            missing.append(bvid)
+            continue
+        grouped.append((video, chunks))
+    if missing:
+        return PreparedChat([], [], f"这些视频没有可用的带时间轴文字稿，暂不能生成可核对的笔记：{', '.join(missing)}。请先检查字幕或 ASR 入库状态。")
+
+    per_video_limit = max(1, 12 // len(grouped))
+    total = sum(len(chunks) for _, chunks in grouped)
+    sources: list[dict] = []
+    context_parts: list[str] = []
+    for video, chunks in grouped:
+        for chunk in _sample_chunks(chunks, per_video_limit):
+            evidence_id = f"E{len(sources) + 1}"
+            source = _build_source_payload({
+                "bvid": video.bvid,
+                "title": video.title,
+                "start_sec": chunk["start_sec"],
+                "end_sec": chunk["end_sec"],
+                "evidence_id": evidence_id,
+                "content_source": video.content_source,
+                "evidence_text": chunk["text"],
+            })
+            sources.append(source)
+            time_label = source.get("timestamp") or "无片段时间"
+            context_parts.append(f"[{evidence_id}] 《{video.title}》约 {time_label}\n{chunk['text']}")
+    notice = (
+        f"> 仅基于 {len(sources)}/{total} 个文字稿片段生成，以下为部分内容笔记草稿；可能遗漏未抽取片段。"
+        if len(sources) < total else ""
+    )
+    return PreparedChat(
+        _build_note_messages("\n\n".join(context_parts), request.question, len(sources), total),
+        sources,
+        notice=notice,
+    )
+
+
+async def _prepare_chat(request: ChatRequest, db: AsyncSession) -> PreparedChat:
+    task = _resolve_task(request)
+    if task == "find":
+        return await _prepare_find_task(request, db)
+    if task == "note":
+        return await _prepare_note_task(request, db)
+    messages, sources, _ = await _prepare_messages(request, db)
+    return PreparedChat(messages, sources)
+
+
 async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[list[dict], List[dict], str]:
     """准备 LLM 消息与来源信息"""
     question = request.question.strip()
-    rag = get_rag_service()
+    if request.folder_ids and not request.session_id:
+        raise HTTPException(status_code=401, detail="指定收藏夹需要先登录")
     folder_ids = []
     if request.session_id:
         folder_ids = await _get_folder_ids_for_session(db, request.session_id, request.folder_ids)
-        logger.info(f"Session: {request.session_id}, 关联 FolderIDs: {folder_ids}")
     bvids = await _get_bvids_by_folder_ids(db, folder_ids) if folder_ids else []
     has_data = len(bvids) > 0
     is_collection_intent = _is_collection_intent(question)
@@ -499,9 +709,11 @@ async def _prepare_messages(request: ChatRequest, db: AsyncSession) -> tuple[lis
     # 7) 向量检索
     docs = []
     try:
-        docs = rag.search(question, k=8, bvids=bvids if bvids else None)
+        if bvids:
+            docs = get_rag_service().search(question, k=8, bvids=bvids)
     except Exception as e:
         logger.warning(f"向量检索失败: {e}")
+    docs = [doc for doc in docs if (doc.metadata or {}).get("bvid") in set(bvids)]
     if docs:
         filtered_docs = _filter_docs_by_keywords(docs, question)
         docs = filtered_docs if filtered_docs else docs
@@ -530,10 +742,15 @@ async def ask_question(request: ChatRequest, db: AsyncSession = Depends(get_db))
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
     try:
-        messages, sources, _ = await _prepare_messages(request, db)
+        prepared = await _prepare_chat(request, db)
+        if prepared.direct_answer is not None:
+            return ChatResponse(answer=prepared.direct_answer, sources=prepared.sources)
         client = _get_llm_client()
-        response = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.2)
-        return ChatResponse(answer=response.choices[0].message.content or "", sources=sources[:5])
+        response = client.chat.completions.create(model=settings.llm_model, messages=prepared.messages, temperature=0.2)
+        answer = response.choices[0].message.content or ""
+        if prepared.notice:
+            answer = f"{prepared.notice}\n\n{answer}"
+        return ChatResponse(answer=answer, sources=prepared.sources)
     except HTTPException: raise
     except Exception as e:
         logger.error(f"问答失败: {e}")
@@ -545,14 +762,21 @@ async def ask_question_stream(request: ChatRequest, db: AsyncSession = Depends(g
     if not request.question or not request.question.strip():
         raise HTTPException(status_code=400, detail="问题不能为空")
     try:
-        messages, sources, _ = await _prepare_messages(request, db)
+        prepared = await _prepare_chat(request, db)
+        if prepared.direct_answer is not None:
+            def generate_direct():
+                yield prepared.direct_answer
+                yield "\n[[SOURCES_JSON]][]"
+            return StreamingResponse(generate_direct(), media_type="text/plain; charset=utf-8")
         client = _get_llm_client()
         def generate():
-            stream = client.chat.completions.create(model=settings.llm_model, messages=messages, temperature=0.2, stream=True)
+            if prepared.notice:
+                yield f"{prepared.notice}\n\n"
+            stream = client.chat.completions.create(model=settings.llm_model, messages=prepared.messages, temperature=0.2, stream=True)
             for chunk in stream:
                 delta = chunk.choices[0].delta
                 if delta and delta.content: yield delta.content
-            yield f"\n[[SOURCES_JSON]]{json.dumps(sources, ensure_ascii=False)}"
+            yield f"\n[[SOURCES_JSON]]{json.dumps(prepared.sources, ensure_ascii=False)}"
         return StreamingResponse(generate(), media_type="text/plain; charset=utf-8")
     except HTTPException: raise
     except Exception as e:
@@ -560,27 +784,43 @@ async def ask_question_stream(request: ChatRequest, db: AsyncSession = Depends(g
         raise HTTPException(status_code=500, detail=f"流式问答失败: {str(e)}")
 
 @router.post("/search")
-async def search_videos(query: str, k: int = 5):
+async def search_videos(
+    query: str = Query(...),
+    session_id: str = Query(..., description="登录会话 ID"),
+    k: int = Query(5, ge=1, le=20),
+    folder_ids: Optional[List[int]] = Query(None, description="可重复传入的收藏夹 media_id"),
+    db: AsyncSession = Depends(get_db),
+):
     """搜索相关视频片段"""
     if not query or not query.strip():
         raise HTTPException(status_code=400, detail="查询不能为空")
+    folder_db_ids = await _get_folder_ids_for_session(db, session_id, folder_ids)
+    bvids = await _get_bvids_by_folder_ids(db, folder_db_ids)
+    if not bvids:
+        return {"results": []}
     try:
         rag = get_rag_service()
-        docs = rag.search(query, k=k)
+        docs = rag.search(query, k=k, bvids=bvids)
+        allowed_bvids = set(bvids)
         results, seen_sources = [], set()
         for doc in docs:
-            bvid = doc.metadata.get("bvid", "")
-            source_key = (bvid, doc.metadata.get("start_sec"), doc.metadata.get("end_sec"))
+            meta = doc.metadata or {}
+            bvid = meta.get("bvid", "")
+            if bvid not in allowed_bvids:
+                continue
+            source_key = (bvid, meta.get("start_sec"), meta.get("end_sec"))
             if source_key in seen_sources:
                 continue
             seen_sources.add(source_key)
+            source = _build_source_payload(meta)
             results.append({
                 "bvid": bvid,
-                "title": doc.metadata.get("title", ""),
-                "url": doc.metadata.get("url", ""),
-                "timestamp": doc.metadata.get("timestamp_text"),
-                "start_sec": doc.metadata.get("start_sec"),
-                "end_sec": doc.metadata.get("end_sec"),
+                "title": source["title"],
+                "url": source["url"],
+                "timestamp": source["timestamp"],
+                "start_sec": source["start_sec"],
+                "end_sec": source["end_sec"],
+                "content_source": meta.get("source"),
                 "content_preview": doc.page_content[:200] + "..." if len(doc.page_content) > 200 else doc.page_content
             })
         return {"results": results}
