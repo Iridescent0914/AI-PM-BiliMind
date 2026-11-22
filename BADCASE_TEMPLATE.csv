@@ -1,6 +1,0 @@
-﻿id,input,actual_output,failure_stage,root_cause,severity,fix_action,retest_result
-B001,仅查我收藏的视频，不要联网。这个旧 API 现在适用吗？,自动触发 Web Search 并混入当前资料,权限安全/工具选择,Verifier 补查动作没有继承 allow_web=false,S0,在工具调用入口校验 allow_web，冲突时只解释本地边界,模拟回归：Web 调用计数=0；回答仅依据本地片段
-B002,2023 年教程中的 LangChain Agent API 现在怎么迁移？,仅复述旧视频 API 并暗示目前仍适用,任务规划/时效性识别,未把历史与当前两个证据空间拆开,S1,增加时效性意图识别，Hybrid 拆 local_query/web_query 并优先官方资料,模拟回归：旧/新用法分栏且有日期与出处
-B003,对比三个 RAG Chunking 教程有什么分歧？,将作者 A 的建议归属作者 B,Evidence Fusion/结果组织,多来源证据拼接后缺少观点级 source_id 绑定,S1,保留视频级 Evidence ID，先构建视频-观点-条件结构再生成比较表,模拟回归：逐条观点能回溯对应视频和片段
-B004,找到讲 KV Cache 为什么缓存 K/V 的片段,找到目标视频但跳转到邻近章节,索引/时间对齐/结果组织,Chunk 起始时间被误当作解释开始位置,S2,存储片段起止时间并使用邻近上下文定位可回看时间窗,模拟回归：跳转时间落在人工标注目标窗口
-B005,视频能否证明某记忆方案 100% 消除幻觉？,输出绝对结论，引用仅谈风险降低,生成/证据验证,Verifier 把主题相关性误当关键 Claim 充分支持,S1,对绝对性 Claim 增加硬校验；不被直接支持时明确拒绝该结论,模拟回归：只陈述来源支持的有限结论并解释边界
