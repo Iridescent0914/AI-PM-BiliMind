@@ -24,3 +24,9 @@ frontend/.vercel/
 
 # Local data artifacts
 data/
+
+
+/docs/PRIVATE_NOTES.md
+/docs/PRODUCT_REVIEW.md
+/docs/BADCASE_TEMPLATE.csv
+/docs/EVAL_SET_TEMPLATE.csv
